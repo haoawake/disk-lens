@@ -2,137 +2,27 @@
 
 package main
 
-// 永久删除：不进回收站，直接从磁盘上抹掉。以管理员身份运行时借助「备份/还原」特权，
+// Windows 上的永久删除：以管理员身份运行时借助「备份/还原」特权，
 // 连只读的、权限设得很死的文件也能删（正被程序占用的除外）。
-// 目录联接（junction）和符号链接只删链接本身，绝不顺着它删到别处去。
 
 import (
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
-type deleteJob struct {
-	path  string
-	parts []string // 在扫描树里的位置
-
-	files  atomic.Int64 // 删掉的文件数
-	bytes  atomic.Int64 // 删掉的字节数
-	failed atomic.Int64 // 删不掉的个数
-	stop   atomic.Bool
-	cur    atomic.Pointer[string]
-
-	mu   sync.Mutex
-	errs []string // 删不掉的（最多记 50 条）
-
-	sem  chan struct{}
-	done chan struct{}
+// isDirNotEmpty 表示删文件夹时它里面还有东西
+func isDirNotEmpty(err error) bool {
+	var errno windows.Errno
+	return errors.As(err, &errno) && errno == windows.ERROR_DIR_NOT_EMPTY
 }
 
-// startDelete 在后台永久删除 path，结束时调用 onDone（在后台线程上）。
-func startDelete(path string, parts []string, onDone func()) *deleteJob {
-	j := &deleteJob{path: path, parts: parts, sem: make(chan struct{}, 16), done: make(chan struct{})}
-	go func() {
-		defer close(j.done)
-		defer onDone()
-		fi, err := os.Lstat(path)
-		if err != nil {
-			j.fail(path, err)
-			return
-		}
-		if fi.IsDir() && fi.Mode()&(os.ModeSymlink|os.ModeIrregular) == 0 {
-			j.removeDir(path)
-			return
-		}
-		if j.remove(path) {
-			j.files.Add(1)
-			j.bytes.Add(diskSize(fi))
-		}
-	}()
-	return j
-}
-
-// removeDir 删掉文件夹里的所有东西，再删文件夹本身。子文件夹尽量并行删。
-func (j *deleteJob) removeDir(path string) {
-	if j.stop.Load() {
-		return
-	}
-	j.cur.Store(&path)
-	f, err := os.Open(path)
-	if err != nil {
-		j.fail(path, err)
-		return
-	}
-	entries, err := f.ReadDir(-1)
-	f.Close()
-	if err != nil && len(entries) == 0 {
-		j.fail(path, err)
-		return
-	}
-	var wg sync.WaitGroup
-	for _, e := range entries {
-		if j.stop.Load() {
-			break
-		}
-		p := filepath.Join(path, e.Name())
-		if e.IsDir() { // 真正的文件夹；目录联接、符号链接不算，下面当成普通项删掉链接本身
-			select {
-			case j.sem <- struct{}{}:
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					defer func() { <-j.sem }()
-					j.removeDir(p)
-				}()
-			default:
-				j.removeDir(p)
-			}
-			continue
-		}
-		var size int64
-		if info, err := e.Info(); err == nil {
-			size = diskSize(info)
-		}
-		if j.remove(p) {
-			j.files.Add(1)
-			j.bytes.Add(size)
-		}
-	}
-	wg.Wait()
-	if j.stop.Load() {
-		return
-	}
-	j.remove(path)
-}
-
-// remove 删除一个文件、一个空文件夹或者一个链接。
-func (j *deleteJob) remove(path string) bool {
-	err := deleteEntry(path)
-	if err != nil {
-		var errno windows.Errno
-		// 文件夹里有删不掉的东西时，文件夹本身自然也删不掉，那些东西已经记过了
-		if !(errors.As(err, &errno) && errno == windows.ERROR_DIR_NOT_EMPTY) {
-			j.fail(path, err)
-		}
-		return false
-	}
-	return true
-}
-
-func (j *deleteJob) fail(path string, err error) {
-	j.failed.Add(1)
-	j.mu.Lock()
-	if len(j.errs) < 50 {
-		j.errs = append(j.errs, path+"："+deleteErrorText(err))
-	}
-	j.mu.Unlock()
-}
+// unlockDir 在打不开要删的文件夹时试着补救，Windows 上没什么可做的
+func unlockDir(string, error) bool { return false }
 
 func deleteErrorText(err error) string {
 	var errno windows.Errno

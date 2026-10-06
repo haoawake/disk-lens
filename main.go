@@ -63,7 +63,7 @@ func friendlyError(err error) string {
 	case errors.Is(err, fs.ErrNotExist):
 		return "找不到这个文件夹，请检查路径。"
 	case errors.Is(err, fs.ErrPermission):
-		return "没有权限访问它，可以试试以管理员身份运行。"
+		return permissionHint
 	}
 	return err.Error()
 }
@@ -85,12 +85,17 @@ func runBench(path string) {
 		select {
 		case <-done:
 			st := s.Status()
-			fmt.Printf("完成：%d 个文件，%d 个文件夹，%s，%d 个打不开，用时 %.2f 秒\n",
-				st.Files, st.Dirs, humanSize(st.Bytes), st.Denied, time.Since(start).Seconds())
+			denied := fmt.Sprintf("%d 个打不开", st.Denied)
+			if st.Privacy > 0 {
+				denied += fmt.Sprintf("（其中 %d 个受隐私保护）", st.Privacy)
+			}
+			fmt.Printf("完成：%d 个文件，%d 个文件夹，%s（%d 字节），%s，用时 %.2f 秒\n",
+				st.Files, st.Dirs, humanSize(st.Bytes), st.Bytes, denied, time.Since(start).Seconds())
 			var m runtime.MemStats
 			runtime.GC()
 			runtime.ReadMemStats(&m)
 			fmt.Printf("内存：%s\n", humanSize(int64(m.HeapAlloc)))
+			printBenchTree(s)
 			runtime.KeepAlive(s)
 			return
 		case <-tick.C:

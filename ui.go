@@ -16,11 +16,6 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const (
-	modeHome = iota
-	modeView
-)
-
 // 自定义消息
 const (
 	wmDrivesLoaded = wmApp + 1
@@ -33,10 +28,6 @@ const (
 	timerToast    = 2
 	timerAnim     = 3
 )
-
-// 三档细节：最小方块面积（平方像素，按 96 DPI 算）和最多画多少块
-var detailArea = [3]float64{90, 30, 10}
-var detailMax = [3]int{3000, 8000, 16000}
 
 type fonts struct {
 	ui, uiBold, small, smallBold, title, big, icon, iconSmall, iconBig uintptr

@@ -1,15 +1,12 @@
-//go:build windows
-
 package main
 
-// 矩形树图：把 View 给出的树排成一块块方块（squarified 算法，方块尽量接近正方形），
-// 画到一张底图上。鼠标悬停、选中的高亮另外画在底图上面，不用每次重排重画。
+// 矩形树图：把 View 给出的树排成一块块方块（squarified 算法，方块尽量接近正方形）。
+// 怎么画由各个平台自己负责（treemap_draw_windows.go、Mac 版的 Objective-C 代码）。
 
 import (
 	"fmt"
 	"math"
 	"strings"
-	"unsafe"
 )
 
 const (
@@ -279,109 +276,34 @@ func findTile(root *tile, parts []string) *tile {
 	return t
 }
 
-// ---------------------------------------------------------------- 绘制
-
-type mapStyle struct {
-	bg, dirBorder, dirHeader, dirHeader2, dirFill, dirText, dirText2 rgb
-	tileText, tileText2, rest, restLine, scanning                    rgb
-	font, fontBold, fontSmall                                        uintptr
-	hatch                                                            uintptr // 斜线画刷
-	scale                                                            float64
-	scanningNow                                                      bool
+// tipText 是鼠标指着方块时提示框里的几行字（名字和大小之外的）
+type tipText struct {
+	share string   // 「占当前文件夹 12%」
+	lines []string // 「文件夹 · 1,234 个文件」之类
+	hint  string   // 「双击进入 · 右键更多操作」
 }
 
-func renderTree(hdc uintptr, root *tile, st *mapStyle) {
-	fill(hdc, root.r, st.bg)
-	for _, k := range root.kids {
-		renderTile(hdc, k, st)
+// tip 生成方块的提示文字。viewSize 是当前视图根目录的大小，用来算占比。
+func (t *tile) tip(viewSize int64) tipText {
+	v := t.v
+	var tt tipText
+	if viewSize > 0 {
+		tt.share = "占当前文件夹 " + formatPercent(float64(v.S)/float64(viewSize))
 	}
-}
-
-func renderTile(hdc uintptr, t *tile, st *mapStyle) {
-	r := t.r
 	switch t.kind {
-	case tileFile:
-		c := catColor(t.cat)
-		in := rect{r.Left, r.Top, r.Right - 1, r.Bottom - 1}
-		if in.W() <= 0 || in.H() <= 0 {
-			fill(hdc, r, c)
-			return
-		}
-		if in.W() >= 6 && in.H() >= 6 {
-			gradientV(hdc, in, c.mix(0xFFFFFF, 0.3), c.mix(0x000000, 0.06))
-		} else {
-			fill(hdc, in, c)
-		}
-		labelTile(hdc, t, in, st.tileText, st.tileText2, st)
-
-	case tileRest:
-		in := rect{r.Left, r.Top, r.Right - 1, r.Bottom - 1}
-		// 斜线纹理：一眼看出这块是「一堆小东西」
-		pSetBkMode.Call(hdc, 2) // OPAQUE：斜线之间的底色
-		pSetBkColor.Call(hdc, st.rest.colorref())
-		pFillRect.Call(hdc, uintptr(unsafe.Pointer(&in)), st.hatch)
-		labelTile(hdc, t, in, st.dirText2, st.dirText2, st)
-
 	case tileDir:
-		fill(hdc, r, st.dirBorder)
-		in := rect{r.Left, r.Top, r.Right - 1, r.Bottom - 1}
-		headerColor := st.dirHeader
-		if t.depth%2 == 0 {
-			headerColor = st.dirHeader2
+		kind := "文件夹 · " + formatCount(v.F) + " 个文件"
+		if v.X {
+			kind += " · 没有权限打开"
 		}
-		fill(hdc, in, headerColor)
-		if t.header {
-			hr := rect{in.Left + int32(4*st.scale), in.Top, in.Right - int32(4*st.scale), t.inner.Top}
-			name := t.v.N
-			if t.v.X {
-				name += "（无权限）"
-			}
-			size := humanSize(t.v.S)
-			if st.scanningNow && t.v.P {
-				size += " · 扫描中"
-			}
-			sw := textWidth(hdc, st.fontSmall, size)
-			nw := textWidth(hdc, st.fontBold, name)
-			if hr.W() > nw+sw+int32(10*st.scale) {
-				textLine(hdc, st.fontBold, name, rect{hr.Left, hr.Top, hr.Right - sw - int32(6*st.scale), hr.Bottom}, st.dirText, dtLeft)
-				c := st.dirText2
-				if st.scanningNow && t.v.P {
-					c = st.scanning
-				}
-				textLine(hdc, st.fontSmall, size, rect{hr.Right - sw, hr.Top, hr.Right, hr.Bottom}, c, dtLeft)
-			} else {
-				textLine(hdc, st.fontBold, name, hr, st.dirText, dtLeft)
-			}
-		}
-		if len(t.kids) == 0 {
-			// 没展开（太小或者是空文件夹）：画成一块实心的
-			c := st.dirFill
-			fill(hdc, t.inner, c)
-			if !t.header {
-				labelTile(hdc, t, t.inner, st.dirText, st.dirText2, st)
-			}
-			return
-		}
-		fill(hdc, t.inner, st.dirFill)
-		for _, k := range t.kids {
-			renderTile(hdc, k, st)
-		}
+		tt.lines = append(tt.lines, kind)
+		tt.hint = "双击进入 · 右键更多操作"
+	case tileFile:
+		tt.lines = append(tt.lines, categories[t.cat].name+"文件")
+		tt.hint = "右键可以打开、定位或删除"
+	case tileRest:
+		tt.lines = append(tt.lines, "这些项目太小，画不出来")
+		tt.hint = "双击进入所在的文件夹看列表"
 	}
-}
-
-// labelTile 在方块里写名字和大小，地方不够就不写
-func labelTile(hdc uintptr, t *tile, r rect, c1, c2 rgb, st *mapStyle) {
-	s := st.scale
-	if r.W() < int32(34*s) || r.H() < int32(15*s) {
-		return
-	}
-	pad := int32(4 * s)
-	lineH := int32(16 * s)
-	in := rect{r.Left + pad, r.Top + int32(2*s), r.Right - pad, r.Bottom}
-	if r.H() >= 2*lineH+int32(4*s) {
-		textLine(hdc, st.font, t.v.N, rect{in.Left, in.Top, in.Right, in.Top + lineH}, c1, dtLeft)
-		textLine(hdc, st.fontSmall, humanSize(t.v.S), rect{in.Left, in.Top + lineH, in.Right, in.Top + 2*lineH}, c2, dtLeft)
-	} else {
-		textLine(hdc, st.font, t.v.N, rect{in.Left, in.Top, in.Right, in.Top + lineH}, c1, dtLeft)
-	}
+	return tt
 }

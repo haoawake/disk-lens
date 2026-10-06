@@ -197,17 +197,6 @@ const (
 	srcCopy = 0x00CC0020
 )
 
-type rect struct{ Left, Top, Right, Bottom int32 }
-
-func (r rect) W() int32 { return r.Right - r.Left }
-func (r rect) H() int32 { return r.Bottom - r.Top }
-func (r rect) has(x, y int32) bool {
-	return x >= r.Left && x < r.Right && y >= r.Top && y < r.Bottom
-}
-func mkRect(x, y, w, h int32) rect { return rect{x, y, x + w, y + h} }
-
-type point struct{ X, Y int32 }
-
 type msg struct {
 	Hwnd    uintptr
 	Message uint32

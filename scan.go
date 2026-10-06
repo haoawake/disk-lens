@@ -50,7 +50,13 @@ type Scan struct {
 	mu sync.RWMutex
 
 	nFiles, nDirs, nDenied atomic.Int64
+	nPrivacy               atomic.Int64           // 打不开的文件夹里，有多少是被系统的隐私保护拦下的（macOS）
 	current                atomic.Pointer[string] // 最近在读的文件夹，给界面显示
+
+	hooks scanHooks // 各个平台对扫描的补充，Windows 上为 nil
+
+	linkMu sync.Mutex
+	links  map[fileKey]*Dir // 有多个硬链接的文件：第一次是在哪个文件夹里算的大小
 
 	jobMu sync.Mutex
 	job   *job
@@ -74,6 +80,46 @@ func workersFor() int {
 	return scanWorkers
 }
 
+// scanHooks 是各个平台对扫描的补充：比如 macOS 上不进入别的磁盘的挂载点、
+// 按实际占用的磁盘块计算大小、硬链接只算一次。
+type scanHooks interface {
+	// displayName 是扫描起点的显示名，返回空字符串表示用文件夹名
+	displayName(root string) string
+	// device 是 path 所在的设备号（扫描起点用）
+	device(path string) uint64
+	// enterDir 决定一个子文件夹 show（要不要出现在树里）、enter（要不要读它里面的东西）。
+	// parentDev 是上一级所在的设备号，dev 返回它自己的
+	enterDir(path string, parentDev uint64, e fs.DirEntry) (show, enter bool, dev uint64)
+	// fileSize 是一个文件算多少字节；owner 是它所在的文件夹
+	fileSize(s *Scan, info fs.FileInfo, owner *Dir) int64
+	// privacyDenied 表示打不开文件夹是因为系统的隐私保护（而不是普通的权限设置）
+	privacyDenied(err error) bool
+}
+
+// fileKey 是一个文件在磁盘上的身份（设备号 + inode），用来认出同一个文件的多个硬链接
+type fileKey struct{ dev, ino uint64 }
+
+// firstLink 表示这是第一次遇到这个有多个硬链接的文件，它的大小算在 owner 里。
+// 之前算过它的文件夹被删掉或者重新扫描了的话，换成这一次算。
+func (s *Scan) firstLink(dev, ino uint64, owner *Dir) bool {
+	k := fileKey{dev, ino}
+	s.linkMu.Lock()
+	defer s.linkMu.Unlock()
+	if s.links == nil {
+		s.links = map[fileKey]*Dir{}
+	}
+	if prev, ok := s.links[k]; ok {
+		s.mu.RLock()
+		gone := prev.removed
+		s.mu.RUnlock()
+		if !gone {
+			return false
+		}
+	}
+	s.links[k] = owner
+	return true
+}
+
 // NewScan 开始扫描 root（必须是绝对路径），立即返回，扫描在后台进行。
 func NewScan(root string) (*Scan, error) {
 	root = filepath.Clean(root)
@@ -88,7 +134,13 @@ func NewScan(root string) (*Scan, error) {
 	if vol := filepath.VolumeName(root); vol != "" && len(root) <= len(vol)+1 {
 		name = vol // "C:\" 显示成 "C:"
 	}
-	s := &Scan{Root: &Dir{Name: name}, RootPath: root}
+	hooks := newScanHooks(root)
+	if hooks != nil {
+		if n := hooks.displayName(root); n != "" {
+			name = n
+		}
+	}
+	s := &Scan{Root: &Dir{Name: name}, RootPath: root, hooks: hooks}
 	s.startJob(s.Root, root, workersFor())
 	return s, nil
 }
@@ -114,6 +166,7 @@ type job struct {
 type task struct {
 	d    *Dir
 	path string
+	dev  uint64 // 所在的设备号（只有 macOS 用到）
 }
 
 func (s *Scan) startJob(top *Dir, path string, workers int) *job {
@@ -121,7 +174,11 @@ func (s *Scan) startJob(top *Dir, path string, workers int) *job {
 	j := &job{s: s, top: top, ctx: ctx, cancel: cancel, done: make(chan struct{}), n: workers}
 	j.cond = sync.NewCond(&j.mu)
 	top.pending.Store(1)
-	j.queue = append(j.queue, task{top, path})
+	var dev uint64
+	if s.hooks != nil {
+		dev = s.hooks.device(path)
+	}
+	j.queue = append(j.queue, task{top, path, dev})
 	s.jobMu.Lock()
 	s.job = j
 	s.jobMu.Unlock()
@@ -265,6 +322,7 @@ func (j *job) read(t task) {
 		denied  bool
 		pending []task
 	)
+	h := s.hooks
 	f, err := os.Open(t.path)
 	if err == nil {
 		var entries []fs.DirEntry
@@ -273,10 +331,21 @@ func (j *job) read(t task) {
 		f.Close()
 		for _, e := range entries {
 			if e.IsDir() { // 符号链接、目录联接（junction）不算文件夹，不跟进去，避免重复统计和死循环
+				p := filepath.Join(t.path, e.Name())
+				enter := true
+				var dev uint64
+				if h != nil {
+					var show bool
+					if show, enter, dev = h.enterDir(p, t.dev, e); !show {
+						continue
+					}
+				}
 				sub := &Dir{Name: e.Name(), parent: d}
-				sub.pending.Store(1)
 				subs = append(subs, sub)
-				pending = append(pending, task{sub, filepath.Join(t.path, e.Name())})
+				if enter {
+					sub.pending.Store(1)
+					pending = append(pending, task{sub, p, dev})
+				}
 				continue
 			}
 			info, ierr := e.Info()
@@ -284,7 +353,12 @@ func (j *job) read(t task) {
 				continue
 			}
 			nfiles++
-			size := diskSize(info)
+			var size int64
+			if h != nil {
+				size = h.fileSize(s, info, d)
+			} else {
+				size = diskSize(info)
+			}
 			if size > 0 {
 				bytes += size
 				list = append(list, File{e.Name(), size})
@@ -294,6 +368,9 @@ func (j *job) read(t task) {
 	if err != nil && len(subs) == 0 && len(list) == 0 {
 		denied = true
 		s.nDenied.Add(1)
+		if h != nil && h.privacyDenied(err) {
+			s.nPrivacy.Add(1)
+		}
 	}
 	slices.SortFunc(list, func(a, b File) int {
 		switch {
@@ -324,7 +401,7 @@ func (j *job) read(t task) {
 		return
 	}
 
-	d.pending.Add(int32(len(subs)))
+	d.pending.Add(int32(len(pending)))
 	j.push(pending)
 	j.finish(d)
 }
@@ -483,6 +560,7 @@ func (s *Scan) Rescan(parts []string) error {
 	markRemoved(old)
 	s.mu.Unlock()
 	s.nDenied.Store(0) // 重新扫描后只统计这次遇到的
+	s.nPrivacy.Store(0)
 	s.startJob(fresh, s.AbsPath(parts), workersFor())
 	return nil
 }
@@ -496,16 +574,18 @@ type Status struct {
 	Dirs    int64  `json:"dirs"`
 	Bytes   int64  `json:"bytes"`
 	Denied  int64  `json:"denied"`
+	Privacy int64  `json:"privacy"` // Denied 里被系统隐私保护拦下的（macOS 的「完全磁盘访问权限」）
 	Elapsed int64  `json:"elapsed"` // 毫秒
 	Current string `json:"current,omitempty"`
 }
 
 func (s *Scan) Status() Status {
 	st := Status{
-		Root:   s.RootPath,
-		Files:  s.nFiles.Load(),
-		Dirs:   s.nDirs.Load(),
-		Denied: s.nDenied.Load(),
+		Root:    s.RootPath,
+		Files:   s.nFiles.Load(),
+		Dirs:    s.nDirs.Load(),
+		Denied:  s.nDenied.Load(),
+		Privacy: s.nPrivacy.Load(),
 	}
 	s.mu.RLock()
 	st.Bytes = s.Root.size.Load()

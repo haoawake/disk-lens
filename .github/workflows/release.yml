@@ -1,8 +1,13 @@
-# 推送 v* 标签就构建 Windows 版程序，发布成 Release。
+# 推送 v* 标签就构建 Windows 版和 Mac 版程序，发布成 Release。
 # 发版步骤：在 CHANGELOG.md 顶部写好这一版的说明（标题形如「## v1.2.0」），
 # 提交后 git tag v1.2.0 && git push origin v1.2.0。
 #
 # 手动运行（workflow_dispatch）只构建、把产物存成 artifact，不发 Release，用来检查流程本身。
+#
+# windows、macos 各自构建，publish 收拢起来发一次。publish 的门是「Windows 版成功了」，
+# 而不是 needs 的默认规则：needs 里任何一个 job 失败，依赖它的 job 会被悄悄跳过（就算挂了
+# continue-on-error 也一样），那样 Mac 版一出问题，连 Windows 版也发不出去。
+# 所以 publish 用 if: always() 自己判断：Windows 版成了就发，Mac 版有就一起带上。
 
 name: release
 
@@ -25,7 +30,7 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
 
-  release:
+  windows:
     needs: test
     runs-on: ubuntu-latest
     steps:
@@ -41,15 +46,71 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ]; then ver="${GITHUB_REF_NAME#v}"; fi
           bash scripts/build.sh "$ver"
 
-      - name: upload artifact
-        if: github.ref_type != 'tag'
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: dist
-          path: dist/*
+          name: pkg-win
+          path: dist/DiskLens-win-*.exe
+          if-no-files-found: error
+
+  macos:
+    # 在 Apple 芯片的 runner 上编出 Apple 芯片 + Intel 的通用程序
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - run: go vet ./...
+      - run: go test ./...
+
+      - name: build
+        run: |
+          ver=dev
+          if [ "$GITHUB_REF_TYPE" = tag ]; then ver="${GITHUB_REF_NAME#v}"; fi
+          bash scripts/build_mac.sh "$ver"
+
+      # 解压出来的 .app 签名完好、能启动（截图模式：打开窗口、画一张图就退出）
+      - name: check the packaged app
+        run: |
+          mkdir -p "$RUNNER_TEMP/check"
+          ditto -x -k dist/DiskLens-mac-universal.zip "$RUNNER_TEMP/check"
+          app="$RUNNER_TEMP/check/文件清理助手.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          lipo -info "$app/Contents/MacOS/DiskLens"
+          perl -e 'alarm shift; exec @ARGV' 120 "$app/Contents/MacOS/DiskLens" -shot "$RUNNER_TEMP/check/home.png" -steps "wait:500,log"
+          test -s "$RUNNER_TEMP/check/home.png"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-mac
+          path: dist/DiskLens-mac-universal.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [windows, macos]
+    if: always() && github.ref_type == 'tag' && needs.windows.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 不写 name = 把所有 artifact 都下下来；Mac 版挂了的话就只有 Windows 版
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: dl
+
+      - name: collect
+        run: |
+          mkdir -p assets
+          find dl -type f \( -name 'DiskLens-win-*.exe' -o -name 'DiskLens-mac-*.zip' \) -exec cp {} assets/ \;
+          ls assets/DiskLens-win-x64.exe assets/DiskLens-win-arm64.exe
+          ls assets/DiskLens-mac-universal.zip || echo "::warning::no macOS build - that job must have failed"
+          (cd assets && sha256sum -- DiskLens-* > SHA256SUMS.txt)
+          ls -l assets
 
       - name: publish release
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -58,7 +119,9 @@ jobs:
           awk -v t="## $tag" 'index($0, t) == 1 { p = 1; next } /^## / { p = 0 } p' CHANGELOG.md > notes.md
           [ -s notes.md ] || echo "文件清理助手 $tag" > notes.md
           if gh release view "$tag" > /dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
+            gh release edit "$tag" --draft=false
+            gh release upload "$tag" assets/* --clobber
           else
-            gh release create "$tag" dist/* --title "文件清理助手 $tag" --notes-file notes.md
+            gh release create "$tag" assets/* --title "文件清理助手 $tag" --notes-file notes.md
           fi
+          gh release view "$tag" --json assets --jq '.assets[].name'

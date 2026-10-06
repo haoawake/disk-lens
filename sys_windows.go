@@ -24,6 +24,9 @@ var (
 	procSHFileOperationW = shell32.NewProc("SHFileOperationW")
 )
 
+// friendlyError 遇到「没有权限」时给的建议
+const permissionHint = "没有权限访问它，可以试试以管理员身份运行。"
+
 // mainWindow 是程序窗口的句柄，弹出的对话框挂在它下面，不会跑到窗口后面去
 var mainWindow atomic.Uintptr
 

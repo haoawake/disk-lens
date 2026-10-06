@@ -415,21 +415,18 @@ func (a *app) paintStatus(dc uintptr, r rect) int32 {
 	spin := false
 	if a.del != nil {
 		spin = true
-		parts = append(parts, "正在删除「"+a.delName+"」", fmt.Sprintf("已删除 %s 个文件", formatCount(a.del.files.Load())), "释放 "+humanSize(a.del.bytes.Load()))
+		parts = a.del.statusParts(a.delName)
 	} else {
 		st := a.scan.Status()
-		secs := float64(st.Elapsed) / 1000
 		switch st.State {
 		case "scanning":
 			spin = true
-			parts = append(parts, "正在扫描", formatCount(st.Files)+" 个文件", humanSize(st.Bytes), fmt.Sprintf("%.0f 秒", secs))
 		case "stopped":
 			glyph, gc = gStop, cText3
-			parts = append(parts, "已停止", formatCount(st.Files)+" 个文件", humanSize(st.Bytes))
 		default:
 			glyph, gc = gCheck, cOK
-			parts = append(parts, "扫描完成", formatCount(st.Files)+" 个文件", humanSize(st.Bytes), formatSeconds(secs))
 		}
+		parts = st.parts()
 	}
 	text := strings.Join(parts, " · ")
 	tw := a.measure(a.f.ui, text)
@@ -723,27 +720,12 @@ func (a *app) selectedTile() *tile {
 
 func (a *app) paintTileTip(dc uintptr, t *tile) {
 	v := t.v
-	var lines []string
-	share := ""
-	if a.viewRoot != nil && a.viewRoot.S > 0 {
-		share = "占当前文件夹 " + formatPercent(float64(v.S)/float64(a.viewRoot.S))
+	var viewSize int64
+	if a.viewRoot != nil {
+		viewSize = a.viewRoot.S
 	}
-	hint := ""
-	switch t.kind {
-	case tileDir:
-		kind := "文件夹 · " + formatCount(v.F) + " 个文件"
-		if v.X {
-			kind += " · 没有权限打开"
-		}
-		lines = append(lines, kind)
-		hint = "双击进入 · 右键更多操作"
-	case tileFile:
-		lines = append(lines, categories[t.cat].name+"文件")
-		hint = "右键可以打开、定位或删除"
-	case tileRest:
-		lines = append(lines, "这些项目太小，画不出来")
-		hint = "双击进入所在的文件夹看列表"
-	}
+	tip := t.tip(viewSize)
+	share, lines, hint := tip.share, tip.lines, tip.hint
 	path := ""
 	if t.kind != tileRest {
 		path = a.scan.AbsPath(append(clonePath(a.path), t.parts()...))

@@ -1,4 +1,4 @@
-# 每次推送都跑一遍测试：界面和删除只有 Windows 版，扫描和排版在 Linux 上也测
+# 每次推送都跑一遍测试：界面和删除有 Windows 版和 Mac 版，扫描和排版在 Linux 上也测
 name: ci
 
 on:
@@ -10,7 +10,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

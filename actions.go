@@ -768,23 +768,3 @@ func (a *app) onListNotify(lp uintptr) (uintptr, bool) {
 	}
 	return 0, false
 }
-
-// ---------------------------------------------------------------- 小工具
-
-func clonePath(p []string) []string { return append([]string(nil), p...) }
-
-func samePath(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func hasPrefix(p, prefix []string) bool {
-	return len(p) >= len(prefix) && samePath(p[:len(prefix)], prefix)
-}

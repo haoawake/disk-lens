@@ -34,6 +34,20 @@ func makeTree(t *testing.T, spec ...string) string {
 	return root
 }
 
+// sizeOf 是这些文件按当前平台的算法算出的大小之和（macOS 上按实际占用的磁盘块算，Windows、Linux 上就是文件长度）
+func sizeOf(t *testing.T, root string, names ...string) int64 {
+	t.Helper()
+	var n int64
+	for _, name := range names {
+		fi, err := os.Lstat(filepath.Join(root, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		n += diskSize(fi)
+	}
+	return n
+}
+
 func scanDone(t *testing.T, root string) *Scan {
 	t.Helper()
 	s, err := NewScan(root)
@@ -58,8 +72,8 @@ func TestScanSizes(t *testing.T) {
 	if st.State != "done" {
 		t.Fatalf("state = %s", st.State)
 	}
-	if st.Bytes != 4707 {
-		t.Errorf("total = %d, want 4707", st.Bytes)
+	if want := sizeOf(t, root, "a/x.bin", "a/y.bin", "a/deep/z.mp4", "b/c.txt", "top.dat", "zero.txt"); st.Bytes != want {
+		t.Errorf("total = %d, want %d", st.Bytes, want)
 	}
 	if st.Files != 6 { // 0 字节的文件也算一个
 		t.Errorf("files = %d, want 6", st.Files)
@@ -68,10 +82,10 @@ func TestScanSizes(t *testing.T) {
 		t.Errorf("dirs = %d, want 4", st.Dirs)
 	}
 	name, size, files, dir, ok := s.Info([]string{"a"})
-	if !ok || !dir || name != "a" || size != 4500 || files != 3 {
+	if !ok || !dir || name != "a" || size != sizeOf(t, root, "a/x.bin", "a/y.bin", "a/deep/z.mp4") || files != 3 {
 		t.Errorf("Info(a) = %q %d %d %v %v", name, size, files, dir, ok)
 	}
-	if _, size, _, dir, ok := s.Info([]string{"a", "deep", "z.mp4"}); !ok || dir || size != 3000 {
+	if _, size, _, dir, ok := s.Info([]string{"a", "deep", "z.mp4"}); !ok || dir || size != sizeOf(t, root, "a/deep/z.mp4") {
 		t.Errorf("Info(z.mp4) = %d %v %v", size, dir, ok)
 	}
 	if !s.Root.Done() {
@@ -80,24 +94,31 @@ func TestScanSizes(t *testing.T) {
 }
 
 func TestViewOrderAndPruning(t *testing.T) {
-	spec := []string{"big.bin=100000", "mid/a=20000", "mid/b=10000"}
+	// 大小取得比磁盘块大得多，这样 macOS 上按磁盘块算时顺序也不变
+	spec := []string{"big.bin=1000000", "mid/a=200000", "mid/b=100000"}
+	var names []string
 	for i := 0; i < 50; i++ {
-		spec = append(spec, "small/f"+string(rune('a'+i%26))+string(rune('a'+i/26))+"=10")
+		n := "small/f" + string(rune('a'+i%26)) + string(rune('a'+i/26))
+		spec = append(spec, n+"=10")
+		names = append(names, n)
 	}
 	root := makeTree(t, spec...)
 	s := scanDone(t, root)
 
-	v, at, list := s.View(nil, ViewOpts{W: 400, H: 300, MinArea: 30}, 1000)
+	total := sizeOf(t, root, append(names, "big.bin", "mid/a", "mid/b")...)
+	// 小文件每个画出来的面积大约是 它的大小 / 总大小 × 整个画面 × 0.8；门槛取它的两倍
+	minArea := 2 * float64(sizeOf(t, root, names[0])) / float64(total) * 400 * 300
+	v, at, list := s.View(nil, ViewOpts{W: 400, H: 300, MinArea: minArea}, 1000)
 	if len(at) != 0 {
 		t.Fatalf("at = %v", at)
 	}
-	if v.S != 130500 {
-		t.Fatalf("root size = %d", v.S)
+	if v.S != total {
+		t.Fatalf("root size = %d, want %d", v.S, total)
 	}
 	if len(v.C) == 0 || v.C[0].N != "big.bin" || v.C[1].N != "mid" {
 		t.Fatalf("children not sorted by size: %+v", v.C)
 	}
-	// small 里每个文件只有 10 字节，在 400×300 的图上远小于 30 平方像素，应该合并成「较小的项目」
+	// small 里每个文件都小于门槛，应该合并成「较小的项目」
 	for _, c := range v.C {
 		if c.N == "small" && len(c.C) != 0 {
 			t.Errorf("small should not be expanded into %d tiles", len(c.C))
@@ -117,8 +138,9 @@ func TestViewOrderAndPruning(t *testing.T) {
 func TestRemoveAndRescan(t *testing.T) {
 	root := makeTree(t, "keep/a=100", "gone/b=300", "gone/c/d=50", "file.txt=40")
 	s := scanDone(t, root)
-	if got := s.Status().Bytes; got != 490 {
-		t.Fatalf("total = %d", got)
+	keepA, file := sizeOf(t, root, "keep/a"), sizeOf(t, root, "file.txt")
+	if got, want := s.Status().Bytes, keepA+file+sizeOf(t, root, "gone/b", "gone/c/d"); got != want {
+		t.Fatalf("total = %d, want %d", got, want)
 	}
 
 	if err := os.RemoveAll(filepath.Join(root, "gone")); err != nil {
@@ -127,10 +149,10 @@ func TestRemoveAndRescan(t *testing.T) {
 	if !s.Remove([]string{"gone"}) {
 		t.Fatal("Remove(gone) = false")
 	}
-	if st := s.Status(); st.Bytes != 140 || st.Files != 2 || st.Dirs != 1 {
+	if st := s.Status(); st.Bytes != keepA+file || st.Files != 2 || st.Dirs != 1 {
 		t.Errorf("after remove: %d bytes, %d files, %d dirs", st.Bytes, st.Files, st.Dirs)
 	}
-	if !s.Remove([]string{"file.txt"}) || s.Status().Bytes != 100 {
+	if !s.Remove([]string{"file.txt"}) || s.Status().Bytes != keepA {
 		t.Errorf("remove file: total = %d", s.Status().Bytes)
 	}
 
@@ -142,10 +164,11 @@ func TestRemoveAndRescan(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Wait()
-	if st := s.Status(); st.Bytes != 1000 || st.Files != 2 {
+	keep := sizeOf(t, root, "keep/a", "keep/new")
+	if st := s.Status(); st.Bytes != keep || st.Files != 2 {
 		t.Errorf("after rescan: %d bytes, %d files", st.Bytes, st.Files)
 	}
-	if _, size, _, _, _ := s.Info([]string{"keep"}); size != 1000 {
+	if _, size, _, _, _ := s.Info([]string{"keep"}); size != keep {
 		t.Errorf("keep = %d", size)
 	}
 }

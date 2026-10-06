@@ -103,12 +103,13 @@ jobs:
 
       - name: collect
         run: |
-          mkdir -p assets
-          find dl -type f \( -name 'DiskLens-win-*.exe' -o -name 'DiskLens-mac-*.zip' \) -exec cp {} assets/ \;
-          ls assets/DiskLens-win-x64.exe assets/DiskLens-win-arm64.exe
-          ls assets/DiskLens-mac-universal.zip || echo "::warning::no macOS build - that job must have failed"
-          (cd assets && sha256sum -- DiskLens-* > SHA256SUMS.txt)
-          ls -l assets
+          # 不能叫 assets：仓库里有 assets/（图标），会把图标一起当成附件发出去
+          mkdir -p upload
+          find dl -type f \( -name 'DiskLens-win-*.exe' -o -name 'DiskLens-mac-*.zip' \) -exec cp {} upload/ \;
+          ls upload/DiskLens-win-x64.exe upload/DiskLens-win-arm64.exe
+          ls upload/DiskLens-mac-universal.zip || echo "::warning::no macOS build - that job must have failed"
+          (cd upload && sha256sum -- DiskLens-* > SHA256SUMS.txt)
+          ls -l upload
 
       - name: publish release
         env:
@@ -120,8 +121,8 @@ jobs:
           [ -s notes.md ] || echo "文件清理助手 $tag" > notes.md
           if gh release view "$tag" > /dev/null 2>&1; then
             gh release edit "$tag" --draft=false
-            gh release upload "$tag" assets/* --clobber
+            gh release upload "$tag" upload/* --clobber
           else
-            gh release create "$tag" assets/* --title "文件清理助手 $tag" --notes-file notes.md
+            gh release create "$tag" upload/* --title "文件清理助手 $tag" --notes-file notes.md
           fi
           gh release view "$tag" --json assets --jq '.assets[].name'
